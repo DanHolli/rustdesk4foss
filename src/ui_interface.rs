@@ -4,7 +4,7 @@ use hbb_common::{
     allow_err,
     bytes::Bytes,
     config::{
-        self, keys::*, option2bool, Config, LocalConfig, PeerConfig, CONNECT_TIMEOUT,
+        self, keys::*, Config, LocalConfig, PeerConfig, CONNECT_TIMEOUT,
         RENDEZVOUS_PORT,
     },
     directories_next,
@@ -208,7 +208,7 @@ pub fn use_texture_render() -> bool {
 
 #[inline]
 pub fn get_local_option(key: String) -> String {
-    LocalConfig::get_option(&key)
+    crate::get_local_option(&key)
 }
 
 #[inline]
@@ -1185,7 +1185,7 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                                 {
                                     let b = OPTIONS.lock().unwrap().get(OPTION_ENABLE_FILE_TRANSFER).map(|x| x.to_string()).unwrap_or_default();
                                     if b != enable_file_transfer {
-                                        clipboard::ContextSend::enable(option2bool(OPTION_ENABLE_FILE_TRANSFER, &b));
+                                        clipboard::ContextSend::enable(config::option2bool(OPTION_ENABLE_FILE_TRANSFER, &b));
                                         enable_file_transfer = b;
                                     }
                                 }
@@ -1297,6 +1297,9 @@ pub async fn change_id_shared(id: String, old_id: String) -> String {
 
 pub async fn change_id_shared_(id: String, old_id: String) -> &'static str {
     if !hbb_common::is_valid_custom_id(&id) {
+        log::debug!("debugging invalid id: \"{id}\", len: {}, base64: \"{}\"", id.len(), crate::encode64(&id));
+        let bom = id.trim_start_matches('\u{FEFF}');
+        log::debug!("bom: {}", hbb_common::is_valid_custom_id(&bom));
         return INVALID_FORMAT;
     }
 
