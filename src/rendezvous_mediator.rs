@@ -2,7 +2,7 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, RwLock,
     },
     time::{Duration, Instant},
 };
@@ -36,6 +36,7 @@ type Message = RendezvousMessage;
 lazy_static::lazy_static! {
     static ref SOLVING_PK_MISMATCH: Mutex<String> = Default::default();
     static ref LAST_MSG: Mutex<(SocketAddr, Instant)> = Mutex::new((SocketAddr::new([0; 4].into(), 0), Instant::now()));
+    static ref LAST_RELAY_MSG: Mutex<(SocketAddr, Instant)> = Mutex::new((SocketAddr::new([0; 4].into(), 0), Instant::now()));
 }
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 static MANUAL_RESTARTED: AtomicBool = AtomicBool::new(false);
@@ -92,6 +93,7 @@ impl RendezvousMediator {
         }
         scrap::codec::test_av1();
         loop {
+            let timeout = Arc::new(RwLock::new(CONNECT_TIMEOUT));
             let conn_start_time = Instant::now();
             *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
             if !config::option2bool("stop-service", &Config::get_option("stop-service"))
@@ -103,9 +105,18 @@ impl RendezvousMediator {
                 MANUAL_RESTARTED.store(false, Ordering::SeqCst);
                 for host in servers.clone() {
                     let server = server.clone();
+                    let timeout = timeout.clone();
                     futs.push(tokio::spawn(async move {
                         if let Err(err) = Self::start(server, host).await {
-                            log::error!("rendezvous mediator error: {err}");
+                            let err = format!("rendezvous mediator error: {err}");
+                            // When user reboot, there might be below error, waiting too long
+                            // (CONNECT_TIMEOUT 18s) will make user think there is bug
+                            if err.contains("10054") || err.contains("11001") {
+                                // No such host is known. (os error 11001)
+                                // An existing connection was forcibly closed by the remote host. (os error 10054): also happens for UDP
+                                *timeout.write().unwrap() = 3000;
+                            }
+                            log::error!("{err}");
                         }
                         // SHOULD_EXIT here is to ensure once one exits, the others also exit.
                         SHOULD_EXIT.store(true, Ordering::SeqCst);
@@ -116,11 +127,15 @@ impl RendezvousMediator {
                 server.write().unwrap().close_connections();
             }
             Config::reset_online();
+            let timeout = *timeout.read().unwrap();
             if !MANUAL_RESTARTED.load(Ordering::SeqCst) {
                 let elapsed = conn_start_time.elapsed().as_millis() as u64;
-                if elapsed < CONNECT_TIMEOUT {
-                    sleep(((CONNECT_TIMEOUT - elapsed) / 1000) as _).await;
+                if elapsed < timeout {
+                    sleep(((timeout - elapsed) / 1000) as _).await;
                 }
+            } else {
+                // https://github.com/rustdesk/rustdesk/issues/12233
+                sleep(0.033).await;
             }
         }
     }
@@ -200,7 +215,7 @@ impl RendezvousMediator {
                                 log::debug!("Non-protobuf message bytes received: {:?}", bytes);
                             }
                         },
-                        Some(Err(e)) => bail!("Failed to receive next {}", e),  // maybe socks5 tcp disconnected
+                        Some(Err(e)) => bail!("Failed to receive next: {}", e),  // maybe socks5 tcp disconnected
                         None => {
                             bail!("Socket receive none. Maybe socks5 server is down.");
                         },
@@ -396,6 +411,14 @@ impl RendezvousMediator {
     }
 
     async fn handle_request_relay(&self, rr: RequestRelay, server: ServerPtr) -> ResultType<()> {
+        let addr = AddrMangle::decode(&rr.socket_addr);
+        let last = *LAST_RELAY_MSG.lock().await;
+        *LAST_RELAY_MSG.lock().await = (addr, Instant::now());
+        // skip duplicate relay request messages
+        if last.0 == addr && last.1.elapsed().as_millis() < 100 {
+            return Ok(());
+        }
+
         self.create_relay(
             rr.socket_addr.into(),
             rr.relay_server,
@@ -811,7 +834,7 @@ async fn udp_nat_listen(
         let res = crate::punch_udp(socket.clone(), true).await?;
         let stream = crate::kcp_stream::KcpStream::accept(
             socket,
-            Duration::from_secs(CONNECT_TIMEOUT as _),
+            Duration::from_millis(CONNECT_TIMEOUT as _),
             res,
         )
         .await?;
