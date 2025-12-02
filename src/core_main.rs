@@ -29,6 +29,9 @@ macro_rules! my_println{
 /// If it returns [`Some`], then the process will continue, and flutter gui will be started.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn core_main() -> Option<Vec<String>> {
+    if !crate::common::global_init() {
+        return None;
+    }
     crate::load_custom_client();
     #[cfg(windows)]
     if !crate::platform::windows::bootstrap() {
@@ -178,6 +181,11 @@ pub fn core_main() -> Option<Vec<String>> {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     init_plugins(&args);
     if args.is_empty() || crate::common::is_empty_uni_link(&args[0]) {
+        #[cfg(target_os = "macos")]
+        {
+            crate::platform::macos::try_remove_temp_update_dir(None);
+        }
+
         #[cfg(windows)]
         hbb_common::config::PeerConfig::preload_peers();
         std::thread::spawn(move || crate::start_server(false, no_server));
@@ -297,14 +305,35 @@ pub fn core_main() -> Option<Vec<String>> {
         {
             use crate::platform;
             if args[0] == "--update" {
-                let _text = match platform::update_me() {
-                    Ok(_) => {
-                        log::info!("{}", translate("Update successfully!".to_string()));
+                if args.len() > 1 && args[1].ends_with(".dmg") {
+                    // Version check is unnecessary unless downgrading to an older version
+                    // that lacks "update dmg" support. This is a special case since we cannot
+                    // detect the version before extracting the DMG, so we skip the check.
+                    let dmg_path = &args[1];
+                    println!("Updating from DMG: {}", dmg_path);
+                    match platform::update_from_dmg(dmg_path) {
+                        Ok(_) => {
+                            println!("Update process from DMG started successfully.");
+                            // The new process will handle the rest. We can exit.
+                        }
+                        Err(err) => {
+                            eprintln!("Failed to start update from DMG: {}", err);
+                        }
                     }
-                    Err(err) => {
-                        log::error!("Update failed with error: {err}");
-                    }
-                };
+                } else {
+                    println!("Starting update process...");
+                    log::info!("Starting update process...");
+                    let _text = match platform::update_me() {
+                        Ok(_) => {
+                            println!("{}", translate("Update successfully!".to_string()));
+                            log::info!("Update successfully!");
+                        }
+                        Err(err) => {
+                            eprintln!("Update failed with error: {}", err);
+                            log::error!("Update failed with error: {err}");
+                        }
+                    };
+                }
                 return None;
             }
         }
