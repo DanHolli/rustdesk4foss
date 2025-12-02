@@ -19,7 +19,7 @@
 > [!Caution]
 > **Unofficial Fork:** <br>
 > The developers of this version of RustDesk does not support any development use of this software. Please support the official Project.
-> All links are to the official project
+> All links are to the official project unless otherwise specified
 > This fork is provided without support
 
 Chat with us: [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/rustdesk) | [Reddit](https://www.reddit.com/r/rustdesk) | [YouTube](https://www.youtube.com/@rustdesk)
@@ -32,13 +32,19 @@ Yet another remote desktop solution, written in Rust. Works out of the box with 
 
 RustDesk welcomes contribution from everyone. See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for help getting started.
 
-[**OFFICIAL FAQ**](https://github.com/rustdesk/rustdesk/wiki/FAQ)
+[**OFFICIAL PROJECT FAQ**](https://github.com/rustdesk/rustdesk/wiki/FAQ)
 
-[**CUSTOM BINARY DOWNLOAD**](https://github.com/DanHolli/rustdesk4foss/releases)
+[**RUSTDESK4FOSS DOWNLOAD**](https://github.com/DanHolli/rustdesk4foss/releases)
 
-[**CUSTOM NIGHTLY BUILD**](https://github.com/DanHolli/rustdesk4foss/releases/tag/nightly)
+[**NIGHTLY RUSTDESK4FOSS BUILD**](https://github.com/DanHolli/rustdesk4foss/releases/tag/nightly)
 
-**OFFICIAL STORES**
+**RUSTDESK4FOSS STORES**
+
+[<img src="https://raw.githubusercontent.com/ImranR98/Obtainium/main/assets/graphics/badge_obtainium.png"
+    alt="Get it on Observium"
+    height="80">](https://apps.obtainium.imranr.dev/redirect?r=obtainium://app/%7B%22id%22%3A%22us.danholli.rd4f%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2Fdanholli%2Frustdesk4foss%22%2C%22author%22%3A%22danholli%22%2C%22name%22%3A%22RustDesk%22%2C%22preferredApkIndex%22%3A0%2C%22additionalSettings%22%3A%22%7B%5C%22includePrereleases%5C%22%3Atrue%2C%5C%22fallbackToOlderReleases%5C%22%3Atrue%2C%5C%22filterReleaseTitlesByRegEx%5C%22%3A%5C%22%5C%22%2C%5C%22filterReleaseNotesByRegEx%5C%22%3A%5C%22%5C%22%2C%5C%22verifyLatestTag%5C%22%3Afalse%2C%5C%22sortMethodChoice%5C%22%3A%5C%22date%5C%22%2C%5C%22useLatestAssetDateAsReleaseDate%5C%22%3Afalse%2C%5C%22releaseTitleAsVersion%5C%22%3Afalse%2C%5C%22trackOnly%5C%22%3Afalse%2C%5C%22versionExtractionRegEx%5C%22%3A%5C%22%5C%22%2C%5C%22matchGroupToUse%5C%22%3A%5C%22%5C%22%2C%5C%22versionDetection%5C%22%3Atrue%2C%5C%22releaseDateAsVersion%5C%22%3Afalse%2C%5C%22useVersionCodeAsOSVersion%5C%22%3Afalse%2C%5C%22apkFilterRegEx%5C%22%3A%5C%22%5C%22%2C%5C%22invertAPKFilter%5C%22%3Afalse%2C%5C%22autoApkFilterByArch%5C%22%3Atrue%2C%5C%22appName%5C%22%3A%5C%22%5C%22%2C%5C%22appAuthor%5C%22%3A%5C%22%5C%22%2C%5C%22shizukuPretendToBeGooglePlay%5C%22%3Afalse%2C%5C%22allowInsecure%5C%22%3Afalse%2C%5C%22exemptFromBackgroundUpdates%5C%22%3Afalse%2C%5C%22skipUpdateNotifications%5C%22%3Afalse%2C%5C%22about%5C%22%3A%5C%22%5C%22%2C%5C%22refreshBeforeDownload%5C%22%3Afalse%2C%5C%22includeZips%5C%22%3Afalse%2C%5C%22zippedApkFilterRegEx%5C%22%3A%5C%22%5C%22%7D%22%2C%22overrideSource%22%3Anull%7D)
+
+**OFFICIAL PROJECT STORES**
 
 [<img src="https://f-droid.org/badge/get-it-on.png"
     alt="Get it on F-Droid"
