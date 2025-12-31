@@ -1,20 +1,20 @@
 use super::{gtk_sudo, CursorData, ResultType};
 use desktop::Desktop;
-use hbb_common::config::keys::OPTION_ALLOW_LINUX_HEADLESS;
 pub use hbb_common::platform::linux::*;
 use hbb_common::{
     allow_err,
     anyhow::anyhow,
     bail,
-    config::Config,
+    config::{keys::OPTION_ALLOW_LINUX_HEADLESS, Config},
     libc::{c_char, c_int, c_long, c_void},
     log,
     message_proto::{DisplayInfo, Resolution},
     regex::{Captures, Regex},
+    users::{get_user_by_name, os::unix::UserExt},
 };
 use std::{
     cell::RefCell,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     process::{Child, Command},
     string::String,
@@ -25,7 +25,6 @@ use std::{
     time::{Duration, Instant},
 };
 use terminfo::{capability as cap, Database};
-use users::{get_user_by_name, os::unix::UserExt};
 use wallpaper;
 
 type Xdo = *const c_void;
@@ -45,6 +44,36 @@ lazy_static::lazy_static! {
                 log::error!("Failed to initialize xterm-256color database: {}", err);
                 None
             }
+        }
+    };
+    // https://github.com/rustdesk/rustdesk/issues/13705
+    // Check if `sudo -E` actually preserves environment.
+    //
+    // This flag is only used by `run_as_user()` (root service -> user session). If the current process is not
+    // running as `root`, this check is meaningless (and `sudo -n` may fail), so we return `false` directly.
+    //
+    // On Ubuntu 25.10, `sudo -E` may still succeed but effectively ignores `-E`. Some versions print a warning
+    // to stderr (wording may vary by locale), so we verify behavior instead:
+    // - Inject a sentinel environment variable into the `sudo` process
+    // - Run `sudo -n -E env` and check whether the sentinel is present in stdout
+    static ref SUDO_E_PRESERVES_ENV: bool = {
+        if !is_root() {
+            log::warn!("Not running as root, SUDO_E_PRESERVES_ENV check skipped");
+            false
+        } else {
+            let key = format!("__RUSTDESK_SUDO_E_TEST_{}", std::process::id());
+            let val = "1";
+            let expected = format!("{key}={val}");
+            Command::new("sudo")
+                // -n for non-interactive to avoid password prompt
+                .env(&key, val)
+                .args(["-n", "-E", "env"])
+                .output()
+                .map(|o| {
+                    o.status.success()
+                        && String::from_utf8_lossy(&o.stdout).contains(expected.as_str())
+                })
+                .unwrap_or(false)
         }
     };
 }
@@ -773,14 +802,58 @@ where
     if uid.is_empty() {
         bail!("No valid uid");
     }
-    let xdg = &format!("XDG_RUNTIME_DIR=/run/user/{}", uid) as &str;
-    let mut args = vec![xdg, "-u", &username, cmd.to_str().unwrap_or("")];
-    args.append(&mut arg.clone());
-    // -E is required to preserve env
-    args.insert(0, "-E");
 
-    let task = Command::new("sudo").envs(envs).args(args).spawn()?;
-    Ok(Some(task))
+    let xdg = &format!("XDG_RUNTIME_DIR=/run/user/{uid}");
+    if *SUDO_E_PRESERVES_ENV {
+        // Original logic: use sudo -E to preserve environment
+        let mut args = vec![xdg, "-u", &username, cmd.to_str().unwrap_or("")];
+        args.append(&mut arg.clone());
+        // -E is required to preserve env
+        args.insert(0, "-E");
+        let task = Command::new("sudo").envs(envs).args(args).spawn()?;
+        Ok(Some(task))
+    } else {
+        // Fallback: sudo -u username env VAR=VALUE ... cmd args
+        // For systems where sudo -E is not supported (e.g., Ubuntu 25.10+)
+        //
+        // SECURITY: No shell is involved here (we use execve-style argv).
+        // Environment is passed via `env` arguments,
+        // so there is no shell injection vector.
+        //
+        // Only accept portable env var names (POSIX portable character set for shells).
+        // Most legitimate env vars follow [A-Za-z_][A-Za-z0-9_]* convention.
+        // Variables with dots (e.g., "java.home") are Java system properties, not env vars.
+        // Being restrictive here is intentional for security in this sudo context.
+        fn is_valid_env_key(key: &str) -> bool {
+            let mut it = key.chars();
+            match it.next() {
+                Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+                _ => return false,
+            }
+            it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+
+        let mut sudo = Command::new("sudo");
+        sudo.arg("-u").arg(&username).arg("--").arg("env").arg(xdg);
+
+        for (k, v) in envs {
+            let key = k.as_ref().to_string_lossy();
+            if !is_valid_env_key(&key) {
+                log::warn!("Skipping environment variable with invalid key: '{}'. Only [A-Za-z_][A-Za-z0-9_]* are allowed in sudo context.", key);
+                continue;
+            }
+            // IMPORTANT: do NOT add shell quotes here; `Command` does not invoke a shell.
+            // Passing KEY=VALUE as a single argv element is safe and preserves spaces.
+            let mut arg = OsString::from(&*key);
+            arg.push("=");
+            arg.push(v.as_ref());
+            sudo.arg(arg);
+        }
+
+        sudo.arg(cmd).args(arg);
+        let task = sudo.spawn()?;
+        Ok(Some(task))
+    }
 }
 
 pub fn get_pa_monitor() -> String {
@@ -861,6 +934,156 @@ pub fn is_installed() -> bool {
     }
 }
 
+/// Get multiple environment variables from a process matching the given criteria.
+/// This version reads /proc directly instead of spawning shell commands.
+///
+/// # Arguments
+/// * `uid` - User ID to filter processes
+/// * `process_pat` - Regex pattern to match process cmdline
+/// * `names` - Environment variable names to retrieve. **Must be <= 64 elements** due to
+///   the internal bitmask used for tie-breaking.
+///
+/// # Panics (debug builds)
+/// Panics if `names.len() > 64`.
+///
+/// # Implementation notes
+/// - Returns values from a *single* best-matching process_pat (for consistency).
+/// - Avoids repeated scanning by parsing `environ` once per process.
+fn get_envs<'a>(
+    uid: &str,
+    process_pat: &str,
+    names: &[&'a str],
+) -> std::collections::HashMap<&'a str, String> {
+    // The tie-breaking logic uses a u64 bitmask, limiting us to 64 variables.
+    debug_assert!(
+        names.len() <= 64,
+        "get_envs: names.len() must be <= 64, got {}",
+        names.len()
+    );
+
+    let empty: std::collections::HashMap<&'a str, String> =
+        names.iter().map(|&n| (n, String::new())).collect();
+
+    let Ok(uid_num) = uid.parse::<u32>() else {
+        return empty;
+    };
+    let Ok(re) = Regex::new(process_pat) else {
+        return empty;
+    };
+
+    // Used for stable tie-breaking when multiple processes match.
+    // Higher bits correspond to earlier entries in `names`.
+    let name_indices: std::collections::HashMap<&'a str, usize> =
+        names.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+
+    let mut best = empty.clone();
+    let mut best_count = 0usize;
+    let mut best_mask: u64 = 0;
+
+    // Iterate /proc to find matching processes
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return best;
+    };
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(pid_str) = file_name.to_str() else {
+            continue;
+        };
+        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        let proc_path = entry.path();
+
+        // Check if process belongs to the specified uid
+        if let Ok(meta) = std::fs::metadata(&proc_path) {
+            use std::os::unix::fs::MetadataExt;
+            if meta.uid() != uid_num {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
+        // Check cmdline matches process pattern
+        let cmdline_path = proc_path.join("cmdline");
+        let Ok(cmdline) = std::fs::read(&cmdline_path) else {
+            continue;
+        };
+        let cmdline_str = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+        if !re.is_match(&cmdline_str) {
+            continue;
+        }
+
+        // Read environ and extract matching variables
+        let environ_path = proc_path.join("environ");
+        let Ok(environ) = std::fs::read(&environ_path) else {
+            continue;
+        };
+
+        let mut found = empty.clone();
+        let mut found_count = 0usize;
+        let mut found_mask: u64 = 0;
+
+        for part in environ.split(|&b| b == 0) {
+            if part.is_empty() {
+                continue;
+            }
+            let Some(eq) = part.iter().position(|&b| b == b'=') else {
+                continue;
+            };
+            let key_bytes = &part[..eq];
+            let val_bytes = &part[eq + 1..];
+
+            let Ok(key) = std::str::from_utf8(key_bytes) else {
+                continue;
+            };
+            if let Some(slot) = found.get_mut(key) {
+                if slot.is_empty() {
+                    *slot = String::from_utf8_lossy(val_bytes).into_owned();
+                    found_count += 1;
+
+                    if let Some(&idx) = name_indices.get(key) {
+                        let total = names.len();
+                        if total <= 64 {
+                            let bit = 1u64 << (total - 1 - idx);
+                            found_mask |= bit;
+                        }
+                    }
+
+                    if found_count == names.len() {
+                        return found;
+                    }
+                }
+            }
+        }
+
+        if found_count > best_count || (found_count == best_count && found_mask > best_mask) {
+            best = found;
+            best_count = found_count;
+            best_mask = found_mask;
+        }
+    }
+
+    best
+}
+
+/// Deprecated: Use `get_envs` instead.
+///
+/// https://github.com/rustdesk/rustdesk/discussions/11959
+///
+/// **Note**: This function is retained for conservative migration. The plan is to gradually
+/// transition all callers to `get_envs` after it proves stable and reliable. Once `get_envs`
+/// is confirmed to work correctly across all use cases, this function will be removed entirely.
+///
+/// # Arguments
+/// * `name` - Environment variable name to retrieve
+/// * `uid` - User ID to filter processes
+/// * `process` - Process name pattern to match
+///
+/// # Returns
+/// The environment variable value, or empty string if not found
 #[inline]
 fn get_env(name: &str, uid: &str, process: &str) -> String {
     let cmd = format!("ps -u {} -f | grep -E '{}' | grep -v 'grep' | tail -1 | awk '{{print $2}}' | xargs -I__ cat /proc/__/environ 2>/dev/null | tr '\\0' '\\n' | grep '^{}=' | tail -1 | sed 's/{}=//g'", uid, process, name, name);
@@ -1100,10 +1323,17 @@ mod desktop {
     pub const XFCE4_PANEL: &str = "xfce4-panel";
     pub const SDDM_GREETER: &str = "sddm-greeter";
 
+    // xdg-desktop-portal runs on all Wayland desktops (GNOME, KDE, wlroots, etc.)
+    const XDG_DESKTOP_PORTAL: &str = "xdg-desktop-portal";
     const XWAYLAND: &str = "Xwayland";
     const IBUS_DAEMON: &str = "ibus-daemon";
     const PLASMA_KDED: &str = "kded[0-9]+";
     const GNOME_GOA_DAEMON: &str = "goa-daemon";
+
+    const ENV_KEY_DISPLAY: &str = "DISPLAY";
+    const ENV_KEY_XAUTHORITY: &str = "XAUTHORITY";
+    const ENV_KEY_WAYLAND_DISPLAY: &str = "WAYLAND_DISPLAY";
+    const ENV_KEY_DBUS_SESSION_BUS_ADDRESS: &str = "DBUS_SESSION_BUS_ADDRESS";
 
     #[derive(Debug, Clone, Default)]
     pub struct Desktop {
@@ -1135,10 +1365,42 @@ mod desktop {
             self.sid.is_empty() || self.is_rustdesk_subprocess
         }
 
+        fn get_display_xauth_wayland(&mut self) {
+            for _ in 1..=10 {
+                // Prefer Wayland-related variables first when multiple portal processes match.
+                let mut envs = get_envs(
+                    &self.uid,
+                    XDG_DESKTOP_PORTAL,
+                    &[
+                        ENV_KEY_WAYLAND_DISPLAY,
+                        ENV_KEY_DBUS_SESSION_BUS_ADDRESS,
+                        ENV_KEY_DISPLAY,
+                        ENV_KEY_XAUTHORITY,
+                    ],
+                );
+                self.display = envs.remove(ENV_KEY_DISPLAY).unwrap_or_default();
+                self.xauth = envs.remove(ENV_KEY_XAUTHORITY).unwrap_or_default();
+                self.wl_display = envs.remove(ENV_KEY_WAYLAND_DISPLAY).unwrap_or_default();
+                self.dbus = envs
+                    .remove(ENV_KEY_DBUS_SESSION_BUS_ADDRESS)
+                    .unwrap_or_default();
+                // For pure Wayland sessions, prefer `WAYLAND_DISPLAY`.
+                // NOTE: On some systems (e.g. Ubuntu 25.10), `DISPLAY`/`XAUTHORITY` may exist even when XWayland
+                // is not running, so do NOT treat them as a success condition here.
+                let has_wayland = !self.wl_display.is_empty();
+                let has_dbus = !self.dbus.is_empty();
+                if has_wayland && has_dbus {
+                    return;
+                }
+                sleep_millis(300);
+            }
+        }
+
         fn get_display_xauth_xwayland(&mut self) {
             let tray = format!("{} +--tray", crate::get_app_name().to_lowercase());
             for _ in 1..=10 {
                 let display_proc = vec![
+                    XDG_DESKTOP_PORTAL,
                     XWAYLAND,
                     IBUS_DAEMON,
                     GNOME_GOA_DAEMON,
@@ -1146,10 +1408,10 @@ mod desktop {
                     tray.as_str(),
                 ];
                 for proc in display_proc {
-                    self.display = get_env("DISPLAY", &self.uid, proc);
-                    self.xauth = get_env("XAUTHORITY", &self.uid, proc);
-                    self.wl_display = get_env("WAYLAND_DISPLAY", &self.uid, proc);
-                    self.dbus = get_env("DBUS_SESSION_BUS_ADDRESS", &self.uid, proc);
+                    self.display = get_env(ENV_KEY_DISPLAY, &self.uid, proc);
+                    self.xauth = get_env(ENV_KEY_XAUTHORITY, &self.uid, proc);
+                    self.wl_display = get_env(ENV_KEY_WAYLAND_DISPLAY, &self.uid, proc);
+                    self.dbus = get_env(ENV_KEY_DBUS_SESSION_BUS_ADDRESS, &self.uid, proc);
                     if !self.display.is_empty() && !self.xauth.is_empty() {
                         return;
                     }
@@ -1169,7 +1431,7 @@ mod desktop {
                     SDDM_GREETER,
                 ];
                 for proc in display_proc {
-                    self.display = get_env("DISPLAY", &self.uid, proc);
+                    self.display = get_env(ENV_KEY_DISPLAY, &self.uid, proc);
                     if !self.display.is_empty() {
                         break;
                     }
@@ -1359,6 +1621,8 @@ mod desktop {
                 if is_xwayland_running() && !self.is_login_wayland() {
                     self.get_display_xauth_xwayland();
                     self.is_rustdesk_subprocess = false;
+                } else if self.is_wayland() {
+                    self.get_display_xauth_wayland();
                 }
                 return;
             }
@@ -1386,8 +1650,7 @@ mod desktop {
                 if is_xwayland_running() {
                     self.get_display_xauth_xwayland();
                 } else {
-                    self.display = "".to_owned();
-                    self.xauth = "".to_owned();
+                    self.get_display_xauth_wayland();
                 }
                 self.is_rustdesk_subprocess = false;
             } else {
@@ -1449,26 +1712,57 @@ pub fn run_cmds_privileged(cmds: &str) -> bool {
     crate::platform::gtk_sudo::run(vec![cmds]).is_ok()
 }
 
+/// Spawn the current executable after a delay.
+///
+/// # Security
+/// The executable path is safely quoted using `shell_quote()` to prevent
+/// command injection vulnerabilities. The `secs` parameter is a u32, so it
+/// cannot contain malicious input.
+///
+/// # Arguments
+/// * `secs` - Number of seconds to wait before spawning
 pub fn run_me_with(secs: u32) {
-    let exe = std::env::current_exe()
-        .unwrap_or("".into())
-        .to_string_lossy()
-        .to_string();
-    // We use `CMD_SH` instead of `sh` to suppress some audit messages on some systems.
-    std::process::Command::new(CMD_SH.as_str())
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(e) => {
+            log::error!("Failed to get current exe: {}", e);
+            return;
+        }
+    };
+
+    // SECURITY: Use shell_quote to safely escape the executable path,
+    // preventing command injection even if the path contains special characters.
+    let exe_quoted = shell_quote(&exe.to_string_lossy());
+
+    // Spawn a background process that sleeps and then executes.
+    // The child process is automatically orphaned when parent exits,
+    // and will be adopted by init (PID 1).
+    Command::new(CMD_SH.as_str())
         .arg("-c")
-        .arg(&format!("sleep {secs}; {exe}"))
+        .arg(&format!("sleep {secs}; exec {exe_quoted}"))
         .spawn()
         .ok();
 }
 
 fn switch_service(stop: bool) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
+    // SECURITY: Use trusted home directory lookup via getpwuid instead of $HOME env var
+    // to prevent confused-deputy attacks where an attacker manipulates environment variables.
+    let home = get_home_dir_trusted()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
     Config::set_option("stop-service".into(), if stop { "Y" } else { "" }.into());
-    if home != "/root" && !Config::get().is_empty() {
-        let p = format!(".config/{}", crate::get_app_name().to_lowercase());
+    if !home.is_empty() && home != "/root" && !Config::get().is_empty() {
+        let app_name_lower = crate::get_app_name().to_lowercase();
         let app_name0 = crate::get_app_name();
-        format!("cp -f {home}/{p}/{app_name0}.toml /root/{p}/; cp -f {home}/{p}/{app_name0}2.toml /root/{p}/;")
+        let config_subdir = format!(".config/{}", app_name_lower);
+
+        // SECURITY: Quote all paths to prevent shell injection from paths containing
+        // spaces, semicolons, or other special characters.
+        let src1 = shell_quote(&format!("{}/{}/{}.toml", home, config_subdir, app_name0));
+        let src2 = shell_quote(&format!("{}/{}/{}2.toml", home, config_subdir, app_name0));
+        let dst = shell_quote(&format!("/root/{}/", config_subdir));
+
+        format!("cp -f {} {}; cp -f {} {};", src1, dst, src2, dst)
     } else {
         "".to_owned()
     }
@@ -1522,7 +1816,15 @@ fn check_if_stop_service() {
 }
 
 pub fn check_autostart_config() -> ResultType<()> {
-    let home = std::env::var("HOME").unwrap_or_default();
+    // SECURITY: Use trusted home directory lookup via getpwuid instead of $HOME env var
+    // to prevent confused-deputy attacks where an attacker manipulates environment variables.
+    let home = match get_home_dir_trusted() {
+        Some(p) => p.to_string_lossy().to_string(),
+        None => {
+            log::warn!("Failed to get trusted home directory for autostart config check");
+            return Ok(());
+        }
+    };
     let app_name = crate::get_app_name().to_lowercase();
     let path = format!("{home}/.config/autostart");
     let file = format!("{path}/{app_name}.desktop");

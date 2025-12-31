@@ -363,7 +363,7 @@ class FfiModel with ChangeNotifier {
           parent.target?.fileModel.refreshAll();
         }
       } else if (name == 'job_error') {
-        parent.target?.fileModel.jobController.jobError(evt);
+        parent.target?.fileModel.handleJobError(evt);
       } else if (name == 'override_file_confirm') {
         parent.target?.fileModel.postOverrideFileConfirm(evt);
       } else if (name == 'load_last_job') {
@@ -1081,7 +1081,8 @@ class FfiModel with ChangeNotifier {
       if (displays.length == 1) {
         bind.sessionSetSize(
           sessionId: sessionId,
-          display: pi.currentDisplay == kAllDisplayValue ? 0 : pi.currentDisplay,
+          display:
+              pi.currentDisplay == kAllDisplayValue ? 0 : pi.currentDisplay,
           width: displays[0].width,
           height: displays[0].height,
         );
@@ -1100,6 +1101,14 @@ class FfiModel with ChangeNotifier {
 
   void _queryAuditGuid(String peerId) async {
     try {
+      if (bind.isDisableAccount()) {
+        return;
+      }
+      if (bind
+          .sessionGetAuditServerSync(sessionId: sessionId, typ: "conn/active")
+          .isEmpty) {
+        return;
+      }
       if (!mainGetLocalBoolOptionSync(
           kOptionAllowAskForNoteAtEndOfConnection)) {
         return;
