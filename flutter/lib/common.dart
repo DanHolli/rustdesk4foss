@@ -1011,13 +1011,15 @@ makeMobileActionsOverlayEntry(VoidCallback? onHide, {FFI? ffi}) {
   });
 }
 
-void showToast(String text, {Duration timeout = const Duration(seconds: 3)}) {
+void showToast(String text,
+    {Duration timeout = const Duration(seconds: 3),
+    Alignment alignment = const Alignment(0.0, 0.8)}) {
   final overlayState = globalKey.currentState?.overlay;
   if (overlayState == null) return;
   final entry = OverlayEntry(builder: (context) {
     return IgnorePointer(
         child: Align(
-            alignment: const Alignment(0.0, 0.8),
+            alignment: alignment,
             child: Container(
               decoration: BoxDecoration(
                 color: MyTheme.color(context).toastBg,
@@ -3039,10 +3041,21 @@ Future<void> start_service(bool is_start) async {
 }
 
 Future<bool> canBeBlocked() async {
-  var access_mode = await bind.mainGetOption(key: kOptionAccessMode);
+  // First check control permission
+  final controlPermission = await bind.mainGetCommon(
+      key: "is-remote-modify-enabled-by-control-permissions");
+  if (controlPermission == "true") {
+    return false;
+  } else if (controlPermission == "false") {
+    return true;
+  }
+
+  // Check local settings
+  var accessMode = await bind.mainGetOption(key: kOptionAccessMode);
+  var isCustomAccessMode = accessMode != 'full' && accessMode != 'view';
   var option = option2bool(kOptionAllowRemoteConfigModification,
       await bind.mainGetOption(key: kOptionAllowRemoteConfigModification));
-  return access_mode == 'view' || (access_mode.isEmpty && !option);
+  return accessMode == 'view' || (isCustomAccessMode && !option);
 }
 
 // to-do: web not implemented
@@ -4057,4 +4070,24 @@ String decode_http_response(http.Response resp) {
 
 bool peerTabShowNote(PeerTabIndex peerTabIndex) {
   return peerTabIndex == PeerTabIndex.ab || peerTabIndex == PeerTabIndex.group;
+}
+
+// TODO: We should support individual bits combinations in the future.
+// But for now, just keep it simple, because the old code only supports single button.
+// No users have requested multi-button support yet.
+String mouseButtonsToPeer(int buttons) {
+  switch (buttons) {
+    case kPrimaryMouseButton:
+      return 'left';
+    case kSecondaryMouseButton:
+      return 'right';
+    case kMiddleMouseButton:
+      return 'wheel';
+    case kBackMouseButton:
+      return 'back';
+    case kForwardMouseButton:
+      return 'forward';
+    default:
+      return '';
+  }
 }
