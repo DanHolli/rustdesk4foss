@@ -5,14 +5,17 @@ import 'package:flutter_breadcrumb/flutter_breadcrumb.dart';
 import 'package:flutter_hbb/models/file_model.dart';
 import 'package:get/get.dart';
 import 'package:toggle_switch/toggle_switch.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../../common.dart';
 import '../../common/widgets/dialog.dart';
 
 class FileManagerPage extends StatefulWidget {
   FileManagerPage(
-      {Key? key, required this.id, this.password, this.isSharedPassword, this.forceRelay})
+      {Key? key,
+      required this.id,
+      this.password,
+      this.isSharedPassword,
+      this.forceRelay})
       : super(key: key);
   final String id;
   final String? password;
@@ -68,6 +71,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
       showLocal ? model.localController : model.remoteController;
   FileDirectory get currentDir => currentFileController.directory.value;
   DirectoryOptions get currentOptions => currentFileController.options.value;
+  final _uniqueKey = UniqueKey();
 
   @override
   void initState() {
@@ -82,7 +86,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
           .showLoading(translate('Connecting...'), onCancel: closeConnection);
     });
     gFFI.ffiModel.updateEventListener(gFFI.sessionId, widget.id);
-    WakelockPlus.enable();
+    WakelockManager.enable(_uniqueKey);
   }
 
   @override
@@ -90,7 +94,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
     model.close().whenComplete(() {
       gFFI.close();
       gFFI.dialogManager.dismissAll();
-      WakelockPlus.disable();
+      WakelockManager.disable(_uniqueKey);
     });
     model.jobController.clear();
     super.dispose();
@@ -113,8 +117,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
           leading: Row(children: [
             IconButton(
                 icon: Icon(Icons.close),
-                onPressed: () =>
-                    clientClose(gFFI.sessionId, gFFI.dialogManager)),
+                onPressed: () => clientClose(gFFI.sessionId, gFFI)),
           ]),
           centerTitle: true,
           title: ToggleSwitch(
@@ -352,15 +355,21 @@ class _FileManagerPageState extends State<FileManagerPage> {
         return Offstage();
       }
 
-      switch (jobTable.last.state) {
+      // Find the first job that is in progress (the one actually transferring data)
+      // Rust backend processes jobs sequentially, so the first inProgress job is the active one
+      final activeJob = jobTable
+              .firstWhereOrNull((job) => job.state == JobState.inProgress) ??
+          jobTable.last;
+
+      switch (activeJob.state) {
         case JobState.inProgress:
           return BottomSheetBody(
             leading: CircularProgressIndicator(),
             title: translate("Waiting"),
             text:
-                "${translate("Speed")}:  ${readableFileSize(jobTable.last.speed)}/s",
+                "${translate("Speed")}:  ${readableFileSize(activeJob.speed)}/s",
             onCanceled: () {
-              model.jobController.cancelJob(jobTable.last.id);
+              model.jobController.cancelJob(activeJob.id);
               jobTable.clear();
             },
           );
@@ -368,7 +377,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
           return BottomSheetBody(
             leading: Icon(Icons.check),
             title: "${translate("Successful")}!",
-            text: jobTable.last.display(),
+            text: activeJob.display(),
             onCanceled: () => jobTable.clear(),
           );
         case JobState.error:
@@ -591,67 +600,67 @@ class _FileManagerViewState extends State<FileManagerView> {
 
   Widget headTools() => Container(
           child: Row(
+        children: [
+          Expanded(child: Obx(() {
+            final home = controller.options.value.home;
+            final isWindows = controller.options.value.isWindows;
+            return BreadCrumb(
+              items: getPathBreadCrumbItems(controller.shortPath, isWindows,
+                  () => controller.goToHomeDirectory(), (list) {
+                var path = "";
+                if (home.startsWith(list[0])) {
+                  // absolute path
+                  for (var item in list) {
+                    path = PathUtil.join(path, item, isWindows);
+                  }
+                } else {
+                  path += home;
+                  for (var item in list) {
+                    path = PathUtil.join(path, item, isWindows);
+                  }
+                }
+                controller.openDirectory(path);
+              }),
+              divider: Icon(Icons.chevron_right),
+              overflow: ScrollableOverflow(controller: _breadCrumbScroller),
+            );
+          })),
+          Row(
             children: [
-              Expanded(child: Obx(() {
-                final home = controller.options.value.home;
-                final isWindows = controller.options.value.isWindows;
-                return BreadCrumb(
-                  items: getPathBreadCrumbItems(controller.shortPath, isWindows,
-                      () => controller.goToHomeDirectory(), (list) {
-                    var path = "";
-                    if (home.startsWith(list[0])) {
-                      // absolute path
-                      for (var item in list) {
-                        path = PathUtil.join(path, item, isWindows);
-                      }
+              IconButton(
+                icon: Icon(Icons.arrow_back),
+                onPressed: controller.goBack,
+              ),
+              IconButton(
+                icon: Icon(Icons.arrow_upward),
+                onPressed: controller.goToParentDirectory,
+              ),
+              PopupMenuButton<SortBy>(
+                  tooltip: "",
+                  icon: Icon(Icons.sort),
+                  itemBuilder: (context) {
+                    return SortBy.values
+                        .map((e) => PopupMenuItem(
+                              child: Text(translate(e.toString())),
+                              value: e,
+                            ))
+                        .toList();
+                  },
+                  onSelected: (sortBy) {
+                    // If selecting the same sort option, flip the order
+                    // If selecting a different sort option, use ascending order
+                    if (controller.sortBy.value == sortBy) {
+                      ascending.value = !controller.sortAscending;
                     } else {
-                      path += home;
-                      for (var item in list) {
-                        path = PathUtil.join(path, item, isWindows);
-                      }
+                      ascending.value = true;
                     }
-                    controller.openDirectory(path);
+                    controller.changeSortStyle(sortBy,
+                        ascending: ascending.value);
                   }),
-                  divider: Icon(Icons.chevron_right),
-                  overflow: ScrollableOverflow(controller: _breadCrumbScroller),
-                );
-              })),
-              Row(
-                children: [
-                  IconButton(
-                    icon: Icon(Icons.arrow_back),
-                    onPressed: controller.goBack,
-                  ),
-                  IconButton(
-                    icon: Icon(Icons.arrow_upward),
-                    onPressed: controller.goToParentDirectory,
-                  ),
-                  PopupMenuButton<SortBy>(
-                      tooltip: "",
-                      icon: Icon(Icons.sort),
-                      itemBuilder: (context) {
-                        return SortBy.values
-                            .map((e) => PopupMenuItem(
-                                  child: Text(translate(e.toString())),
-                                  value: e,
-                                ))
-                            .toList();
-                      },
-                      onSelected: (sortBy) {
-                        // If selecting the same sort option, flip the order
-                        // If selecting a different sort option, use ascending order
-                        if (controller.sortBy.value == sortBy) {
-                          ascending.value = !controller.sortAscending;
-                        } else {
-                          ascending.value = true;
-                        }
-                        controller.changeSortStyle(sortBy, ascending: ascending.value);
-                      }
-                  ),
-                ],
-              )
             ],
-          ));
+          )
+        ],
+      ));
 
   Widget listTail() => Obx(() => Container(
         height: 100,

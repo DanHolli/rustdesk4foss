@@ -23,7 +23,11 @@ pub use clipboard::ClipboardFile;
 use hbb_common::{
     allow_err, bail, bytes,
     bytes_codec::BytesCodec,
-    config::{self, keys::OPTION_ALLOW_WEBSOCKET, Config, Config2},
+    config::{
+        self,
+        keys::{self, OPTION_ALLOW_WEBSOCKET},
+        Config, Config2,
+    },
     futures::StreamExt as _,
     futures_util::sink::SinkExt,
     log, password_security as password, timeout,
@@ -112,6 +116,33 @@ pub enum FS {
         path: String,
         new_name: String,
     },
+    // CM-side file reading operations (Windows only)
+    // These enable Connection Manager to read files and stream them back to Connection
+    ReadFile {
+        path: String,
+        id: i32,
+        file_num: i32,
+        include_hidden: bool,
+        conn_id: i32,
+        overwrite_detection: bool,
+    },
+    CancelRead {
+        id: i32,
+        conn_id: i32,
+    },
+    SendConfirmForRead {
+        id: i32,
+        file_num: i32,
+        skip: bool,
+        offset_blk: u32,
+        conn_id: i32,
+    },
+    ReadAllFiles {
+        path: String,
+        id: i32,
+        include_hidden: bool,
+        conn_id: i32,
+    },
 }
 
 #[cfg(target_os = "windows")]
@@ -195,6 +226,7 @@ pub enum Data {
         is_terminal: bool,
         peer_id: String,
         name: String,
+        avatar: String,
         authorized: bool,
         port_forward: String,
         keyboard: bool,
@@ -268,6 +300,72 @@ pub enum Data {
     #[cfg(windows)]
     ControlledSessionCount(usize),
     CmErr(String),
+    // CM-side file reading responses (Windows only)
+    // These are sent from CM back to Connection when CM handles file reading
+    /// Response to ReadFile: contains initial file list or error
+    ReadJobInitResult {
+        id: i32,
+        file_num: i32,
+        include_hidden: bool,
+        conn_id: i32,
+        /// Serialized protobuf bytes of FileDirectory, or error string
+        result: Result<Vec<u8>, String>,
+    },
+    /// File data block read by CM.
+    ///
+    /// The actual data is sent separately via `send_raw()` after this message to avoid
+    /// JSON encoding overhead for large binary data. This mirrors the `WriteBlock` pattern.
+    ///
+    /// **Protocol:**
+    /// - Sender: `send(FileBlockFromCM{...})` then `send_raw(data)`
+    /// - Receiver: `next()` returns `FileBlockFromCM`, then `next_raw()` returns data bytes
+    ///
+    /// **Note on empty data (e.g., empty files):**
+    /// Empty data is supported. The IPC connection uses `BytesCodec` with `raw=false` (default),
+    /// which prefixes each frame with a length header. So `send_raw(Bytes::new())` sends a
+    /// 1-byte frame (length=0), and `next_raw()` correctly returns an empty `BytesMut`.
+    /// See `libs/hbb_common/src/bytes_codec.rs` test `test_codec2` for verification.
+    FileBlockFromCM {
+        id: i32,
+        file_num: i32,
+        /// Data is sent separately via `send_raw()` to avoid JSON encoding overhead.
+        /// This field is skipped during serialization; sender must call `send_raw()` after sending.
+        /// Receiver must call `next_raw()` and populate this field manually.
+        #[serde(skip)]
+        data: bytes::Bytes,
+        compressed: bool,
+        conn_id: i32,
+    },
+    /// File read completed successfully
+    FileReadDone {
+        id: i32,
+        file_num: i32,
+        conn_id: i32,
+    },
+    /// File read failed with error
+    FileReadError {
+        id: i32,
+        file_num: i32,
+        err: String,
+        conn_id: i32,
+    },
+    /// Digest info from CM for overwrite detection
+    FileDigestFromCM {
+        id: i32,
+        file_num: i32,
+        last_modified: u64,
+        file_size: u64,
+        is_resume: bool,
+        conn_id: i32,
+    },
+    /// Response to ReadAllFiles: recursive directory listing
+    AllFilesResult {
+        id: i32,
+        conn_id: i32,
+        path: String,
+        /// Serialized protobuf bytes of FileDirectory, or error string
+        result: Result<Vec<u8>, String>,
+    },
     CheckHwcodec,
     #[cfg(feature = "flutter")]
     VideoConnCount(Option<usize>),
@@ -291,6 +389,9 @@ pub enum Data {
     SocksWs(Option<Box<(Option<config::Socks5Server>, String)>>),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     Whiteboard((String, crate::whiteboard::CustomEvent)),
+    ControlPermissionsRemoteModify(Option<bool>),
+    #[cfg(target_os = "windows")]
+    FileTransferEnabledState(Option<bool>),
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -531,8 +632,29 @@ async fn handle(data: Data, stream: &mut Connection) {
                     value = Some(Config::get_id());
                 } else if name == "temporary-password" {
                     value = Some(password::temporary_password());
-                } else if name == "permanent-password" {
-                    value = Some(Config::get_permanent_password());
+                } else if name == "permanent-password-storage-and-salt" {
+                    let (storage, salt) = Config::get_local_permanent_password_storage_and_salt();
+                    value = Some(storage + "\n" + &salt);
+                } else if name == "permanent-password-set" {
+                    value = Some(if Config::has_permanent_password() {
+                        "Y".to_owned()
+                    } else {
+                        "N".to_owned()
+                    });
+                } else if name == "permanent-password-is-preset" {
+                    let hard = config::HARD_SETTINGS
+                        .read()
+                        .unwrap()
+                        .get("password")
+                        .cloned()
+                        .unwrap_or_default();
+                    let is_preset =
+                        !hard.is_empty() && Config::matches_permanent_password_plain(&hard);
+                    value = Some(if is_preset {
+                        "Y".to_owned()
+                    } else {
+                        "N".to_owned()
+                    });
                 } else if name == "salt" {
                     value = Some(Config::get_salt());
                 } else if name == "rendezvous_server" {
@@ -568,13 +690,24 @@ async fn handle(data: Data, stream: &mut Connection) {
                 allow_err!(stream.send(&Data::Config((name, value))).await);
             }
             Some(value) => {
+                let mut updated = true;
                 if name == "id" {
                     Config::set_key_confirmed(false);
                     Config::set_id(&value);
                 } else if name == "temporary-password" {
                     password::update_temporary_password();
                 } else if name == "permanent-password" {
-                    Config::set_permanent_password(&value);
+                    if Config::is_disable_change_permanent_password() {
+                        log::warn!("Changing permanent password is disabled");
+                        updated = false;
+                    } else {
+                        Config::set_permanent_password(&value);
+                    }
+                    // Explicitly ACK/NACK permanent-password writes. This allows UIs/FFI to
+                    // distinguish "accepted by daemon" vs "IPC send succeeded" without
+                    // reading back any secret.
+                    let ack = if updated { "Y" } else { "N" }.to_owned();
+                    allow_err!(stream.send(&Data::Config((name.clone(), Some(ack)))).await);
                 } else if name == "salt" {
                     Config::set_salt(&value);
                 } else if name == "voice-call-input" {
@@ -584,7 +717,9 @@ async fn handle(data: Data, stream: &mut Connection) {
                 } else {
                     return;
                 }
-                log::info!("{} updated", name);
+                if updated {
+                    log::info!("{} updated", name);
+                }
             }
         },
         Data::Options(value) => match value {
@@ -769,6 +904,31 @@ async fn handle(data: Data, stream: &mut Connection) {
                 // Port forward session count is only a get value.
             }
         },
+        Data::ControlPermissionsRemoteModify(_) => {
+            use hbb_common::rendezvous_proto::control_permissions::Permission;
+            let state =
+                crate::server::get_control_permission_state(Permission::remote_modify, true);
+            allow_err!(
+                stream
+                    .send(&Data::ControlPermissionsRemoteModify(state))
+                    .await
+            );
+        }
+        #[cfg(target_os = "windows")]
+        Data::FileTransferEnabledState(_) => {
+            use hbb_common::rendezvous_proto::control_permissions::Permission;
+            let state = crate::server::get_control_permission_state(Permission::file, false);
+            let enabled = state.unwrap_or_else(|| {
+                crate::server::Connection::is_permission_enabled_locally(
+                    config::keys::OPTION_ENABLE_FILE_TRANSFER,
+                )
+            });
+            allow_err!(
+                stream
+                    .send(&Data::FileTransferEnabledState(Some(enabled)))
+                    .await
+            );
+        }
         _ => {}
     }
 }
@@ -1017,13 +1177,57 @@ pub fn update_temporary_password() -> ResultType<()> {
     set_config("temporary-password", "".to_owned())
 }
 
-pub fn get_permanent_password() -> String {
-    if let Ok(Some(v)) = get_config("permanent-password") {
-        Config::set_permanent_password(&v);
-        v
-    } else {
-        Config::get_permanent_password()
+fn apply_permanent_password_storage_and_salt_payload(payload: Option<&str>) -> ResultType<()> {
+    let Some(payload) = payload else {
+        return Ok(());
+    };
+    let Some((storage, salt)) = payload.split_once('\n') else {
+        bail!("Invalid permanent-password-storage-and-salt payload");
+    };
+
+    if storage.is_empty() {
+        Config::set_permanent_password_storage_for_sync("", "")?;
+        return Ok(());
     }
+
+    Config::set_permanent_password_storage_for_sync(storage, salt)?;
+    Ok(())
+}
+
+pub fn sync_permanent_password_storage_from_daemon() -> ResultType<()> {
+    let v = get_config("permanent-password-storage-and-salt")?;
+    apply_permanent_password_storage_and_salt_payload(v.as_deref())
+}
+
+async fn sync_permanent_password_storage_from_daemon_async() -> ResultType<()> {
+    let ms_timeout = 1_000;
+    let v = get_config_async("permanent-password-storage-and-salt", ms_timeout).await?;
+    apply_permanent_password_storage_and_salt_payload(v.as_deref())
+}
+
+pub fn is_permanent_password_set() -> bool {
+    match get_config("permanent-password-set") {
+        Ok(Some(v)) => {
+            let v = v.trim();
+            return v == "Y";
+        }
+        Ok(None) => {
+            // No response/value (timeout).
+        }
+        Err(_) => {
+            // Connection error.
+        }
+    }
+    log::warn!("Failed to query permanent password state from daemon");
+    false
+}
+
+pub fn is_permanent_password_preset() -> bool {
+    if let Ok(Some(v)) = get_config("permanent-password-is-preset") {
+        let v = v.trim();
+        return v == "Y";
+    }
+    false
 }
 
 pub fn get_fingerprint() -> String {
@@ -1033,8 +1237,41 @@ pub fn get_fingerprint() -> String {
 }
 
 pub fn set_permanent_password(v: String) -> ResultType<()> {
-    Config::set_permanent_password(&v);
-    set_config("permanent-password", v)
+    if Config::is_disable_change_permanent_password() {
+        bail!("Changing permanent password is disabled");
+    }
+    if set_permanent_password_with_ack(v)? {
+        Ok(())
+    } else {
+        bail!("Changing permanent password was rejected by daemon");
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn set_permanent_password_with_ack(v: String) -> ResultType<bool> {
+    set_permanent_password_with_ack_async(v).await
+}
+
+async fn set_permanent_password_with_ack_async(v: String) -> ResultType<bool> {
+    // The daemon ACK/NACK is expected quickly since it applies the config in-process.
+    let ms_timeout = 1_000;
+    let mut c = connect(ms_timeout, "").await?;
+    c.send_config("permanent-password", v).await?;
+    if let Some(Data::Config((name2, Some(v)))) = c.next_timeout(ms_timeout).await? {
+        if name2 == "permanent-password" {
+            let v = v.trim();
+            let ok = v == "Y";
+            if ok {
+                // Ensure the hashed permanent password storage is written to the user config file.
+                // This sync must not affect the daemon ACK outcome.
+                if let Err(err) = sync_permanent_password_storage_from_daemon_async().await {
+                    log::warn!("Failed to sync permanent password storage from daemon: {err}");
+                }
+            }
+            return Ok(ok);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(feature = "flutter")]
@@ -1458,6 +1695,6 @@ mod test {
     #[test]
     fn verify_ffi_enum_data_size() {
         println!("{}", std::mem::size_of::<Data>());
-        assert!(std::mem::size_of::<Data>() <= 96);
+        assert!(std::mem::size_of::<Data>() <= 120);
     }
 }

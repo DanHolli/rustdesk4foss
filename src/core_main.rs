@@ -29,6 +29,9 @@ macro_rules! my_println{
 /// If it returns [`Some`], then the process will continue, and flutter gui will be started.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn core_main() -> Option<Vec<String>> {
+    if !crate::common::global_init() {
+        return None;
+    }
     crate::load_custom_client();
     #[cfg(windows)]
     if !crate::platform::windows::bootstrap() {
@@ -137,7 +140,7 @@ pub fn core_main() -> Option<Vec<String>> {
     {
         _is_quick_support |= !crate::platform::is_installed()
             && args.is_empty()
-            && (arg_exe.to_lowercase().contains("-qs-")
+            && (is_quick_support_exe(&arg_exe)
                 || config::LocalConfig::get_option("pre-elevate-service") == "Y"
                 || (!click_setup && crate::platform::is_elevated(None).unwrap_or(false)));
         crate::portable_service::client::set_quick_support(_is_quick_support);
@@ -178,8 +181,16 @@ pub fn core_main() -> Option<Vec<String>> {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     init_plugins(&args);
     if args.is_empty() || crate::common::is_empty_uni_link(&args[0]) {
+        #[cfg(target_os = "macos")]
+        {
+            crate::platform::macos::try_remove_temp_update_dir(None);
+        }
+
         #[cfg(windows)]
-        hbb_common::config::PeerConfig::preload_peers();
+        {
+            crate::platform::try_remove_temp_update_files();
+            hbb_common::config::PeerConfig::preload_peers();
+        }
         std::thread::spawn(move || crate::start_server(false, no_server));
     } else {
         #[cfg(windows)]
@@ -194,17 +205,24 @@ pub fn core_main() -> Option<Vec<String>> {
                 if config::is_disable_installation() {
                     return None;
                 }
-                let res = platform::update_me(false);
-                let text = match res {
-                    Ok(_) => translate("Update successfully!".to_string()),
-                    Err(err) => {
-                        log::error!("Failed with error: {err}");
-                        translate("Update failed!".to_string())
+
+                let text = match crate::platform::prepare_custom_client_update() {
+                    Err(e) => {
+                        log::error!("Error preparing custom client update: {}", e);
+                        "Update failed!".to_string()
                     }
+                    Ok(false) => "Update failed!".to_string(),
+                    Ok(true) => match platform::update_me(false) {
+                        Ok(_) => "Updated successfully!".to_string(),
+                        Err(err) => {
+                            log::error!("Failed with error: {err}");
+                            "Update failed!".to_string()
+                        }
+                    },
                 };
                 Toast::new(Toast::POWERSHELL_APP_ID)
                     .title(&config::APP_NAME.read().unwrap())
-                    .text1(&text)
+                    .text1(&translate(text))
                     .sound(Some(Sound::Default))
                     .duration(Duration::Short)
                     .show()
@@ -297,14 +315,35 @@ pub fn core_main() -> Option<Vec<String>> {
         {
             use crate::platform;
             if args[0] == "--update" {
-                let _text = match platform::update_me() {
-                    Ok(_) => {
-                        log::info!("{}", translate("Update successfully!".to_string()));
+                if args.len() > 1 && args[1].ends_with(".dmg") {
+                    // Version check is unnecessary unless downgrading to an older version
+                    // that lacks "update dmg" support. This is a special case since we cannot
+                    // detect the version before extracting the DMG, so we skip the check.
+                    let dmg_path = &args[1];
+                    println!("Updating from DMG: {}", dmg_path);
+                    match platform::update_from_dmg(dmg_path) {
+                        Ok(_) => {
+                            println!("Update process from DMG started successfully.");
+                            // The new process will handle the rest. We can exit.
+                        }
+                        Err(err) => {
+                            eprintln!("Failed to start update from DMG: {}", err);
+                        }
                     }
-                    Err(err) => {
-                        log::error!("Update failed with error: {err}");
-                    }
-                };
+                } else {
+                    println!("Starting update process...");
+                    log::info!("Starting update process...");
+                    let _text = match platform::update_me() {
+                        Ok(_) => {
+                            println!("{}", translate("Updated successfully!".to_string()));
+                            log::info!("Updated successfully!");
+                        }
+                        Err(err) => {
+                            eprintln!("Update failed with error: {}", err);
+                            log::error!("Update failed with error: {err}");
+                        }
+                    };
+                }
                 return None;
             }
         }
@@ -377,6 +416,10 @@ pub fn core_main() -> Option<Vec<String>> {
                 println!("Settings are disabled!");
                 return None;
             }
+            if config::Config::is_disable_change_permanent_password() {
+                println!("Changing permanent password is disabled!");
+                return None;
+            }
             if args.len() == 2 {
                 if crate::platform::is_installed() && is_root() {
                     if let Err(err) = crate::ipc::set_permanent_password(args[1].to_owned()) {
@@ -390,6 +433,10 @@ pub fn core_main() -> Option<Vec<String>> {
             }
             return None;
         } else if args[0] == "--set-unlock-pin" {
+            if config::Config::is_disable_unlock_pin() {
+                println!("Unlock PIN is disabled!");
+                return None;
+            }
             #[cfg(feature = "flutter")]
             if args.len() == 2 {
                 if crate::platform::is_installed() && is_root() {
@@ -409,6 +456,10 @@ pub fn core_main() -> Option<Vec<String>> {
         } else if args[0] == "--set-id" {
             if config::is_disable_settings() {
                 println!("Settings are disabled!");
+                return None;
+            }
+            if config::Config::is_disable_change_id() {
+                println!("Changing ID is disabled!");
                 return None;
             }
             if args.len() == 2 {
@@ -573,6 +624,17 @@ pub fn core_main() -> Option<Vec<String>> {
         } else if args[0] == "--check-hwcodec-config" {
             #[cfg(feature = "hwcodec")]
             crate::ipc::hwcodec_process();
+            return None;
+        } else if args[0] == "--terminal-helper" {
+            // Terminal helper process - runs as user to create ConPTY
+            // This is needed because ConPTY has compatibility issues with CreateProcessAsUserW
+            #[cfg(target_os = "windows")]
+            {
+                let helper_args: Vec<String> = args[1..].to_vec();
+                if let Err(e) = crate::server::terminal_helper::run_terminal_helper(&helper_args) {
+                    log::error!("Terminal helper failed: {}", e);
+                }
+            }
             return None;
         } else if args[0] == "--cm" {
             // call connection manager to establish connections
@@ -776,4 +838,13 @@ fn is_root() -> bool {
     }
     #[allow(unreachable_code)]
     crate::platform::is_root()
+}
+
+/// Check if the executable is a Quick Support version.
+/// Note: This function must be kept in sync with `libs/portable/src/main.rs`.
+#[cfg(windows)]
+#[inline]
+fn is_quick_support_exe(exe: &str) -> bool {
+    let exe = exe.to_lowercase();
+    exe.contains("-qs-") || exe.contains("-qs.exe") || exe.contains("_qs.exe")
 }

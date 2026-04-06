@@ -812,7 +812,7 @@ class RustdeskImpl {
   }
 
   String mainGetAppNameSync({dynamic hint}) {
-    return 'RustDesk';
+    return js.context.callMethod('getByName', ['app-name']);
   }
 
   String mainUriPrefixSync({dynamic hint}) {
@@ -1159,10 +1159,6 @@ class RustdeskImpl {
     return Future.value('');
   }
 
-  Future<String> mainGetPermanentPassword({dynamic hint}) {
-    return Future.value('');
-  }
-
   Future<String> mainGetFingerprint({dynamic hint}) {
     return Future.value('');
   }
@@ -1346,9 +1342,9 @@ class RustdeskImpl {
     throw UnimplementedError("mainUpdateTemporaryPassword");
   }
 
-  Future<void> mainSetPermanentPassword(
+  Future<bool> mainSetPermanentPasswordWithResult(
       {required String password, dynamic hint}) {
-    throw UnimplementedError("mainSetPermanentPassword");
+    throw UnimplementedError("mainSetPermanentPasswordWithResult");
   }
 
   Future<bool> mainCheckSuperUserPermission({dynamic hint}) {
@@ -1609,23 +1605,28 @@ class RustdeskImpl {
   }
 
   bool isCustomClient({dynamic hint}) {
-    return false;
+    // is_custom_client() checks if app name is not "RustDesk"
+    return mainGetAppNameSync(hint: hint) != "RustDesk";
   }
 
   bool isDisableSettings({dynamic hint}) {
-    return false;
+    // Checks HARD_SETTINGS["disable-settings"] == "Y"
+    return mainGetHardOption(key: "disable-settings", hint: hint) == "Y";
   }
 
   bool isDisableAb({dynamic hint}) {
-    return false;
+    // Checks HARD_SETTINGS["disable-ab"] == "Y"
+    return mainGetHardOption(key: "disable-ab", hint: hint) == "Y";
   }
 
   bool isDisableGroupPanel({dynamic hint}) {
-    return false;
+    // Checks LocalConfig::get_option("disable-group-panel") == "Y"
+    return mainGetLocalOption(key: "disable-group-panel", hint: hint) == "Y";
   }
 
   bool isDisableAccount({dynamic hint}) {
-    return false;
+    // Checks HARD_SETTINGS["disable-account"] == "Y"
+    return mainGetHardOption(key: "disable-account", hint: hint) == "Y";
   }
 
   bool isDisableInstallation({dynamic hint}) {
@@ -1748,7 +1749,7 @@ class RustdeskImpl {
   }
 
   String mainGetHardOption({required String key, dynamic hint}) {
-    throw UnimplementedError("mainGetHardOption");
+    return mainGetLocalOption(key: key, hint: hint);
   }
 
   Future<void> mainCheckHwcodec({dynamic hint}) {
@@ -1821,7 +1822,7 @@ class RustdeskImpl {
   }
 
   String mainGetBuildinOption({required String key, dynamic hint}) {
-    return '';
+    return mainGetLocalOption(key: key, hint: hint);
   }
 
   String installInstallOptions({dynamic hint}) {
@@ -1977,6 +1978,60 @@ class RustdeskImpl {
             'terminal_id': terminalId,
           })
         ]));
+  }
+
+  Future<int?> sessionGetEdgeScrollEdgeThickness(
+      {required UuidValue sessionId, dynamic hint}) {
+    final thickness = js.context.callMethod(
+        'getByName', ['option:session', 'edge-scroll-edge-thickness']);
+    return Future(() => int.tryParse(thickness) ?? 100);
+  }
+
+  Future<void> sessionSetEdgeScrollEdgeThickness(
+      {required UuidValue sessionId, required int value, dynamic hint}) {
+    return Future(() => js.context.callMethod('setByName',
+        ['option:session', 'edge-scroll-edge-thickness', value.toString()]));
+  }
+
+  String sessionGetConnSessionId({required UuidValue sessionId, dynamic hint}) {
+    return js.context.callMethod('getByName', ['conn_session_id']);
+  }
+
+  bool willSessionCloseCloseSession(
+      {required UuidValue sessionId, dynamic hint}) {
+    return true;
+  }
+
+  String sessionGetLastAuditNote({required UuidValue sessionId, dynamic hint}) {
+    return js.context.callMethod('getByName', ['last_audit_note']);
+  }
+
+  Future<void> sessionSetAuditGuid(
+      {required UuidValue sessionId, required String guid, dynamic hint}) {
+    return Future(
+        () => js.context.callMethod('setByName', ['audit_guid', guid]));
+  }
+
+  String sessionGetAuditGuid({required UuidValue sessionId, dynamic hint}) {
+    return js.context.callMethod('getByName', ['audit_guid']);
+  }
+
+  bool mainSetCursorPosition({required int x, required int y, dynamic hint}) {
+    return false;
+  }
+
+  bool mainClipCursor(
+      {required int left,
+      required int top,
+      required int right,
+      required int bottom,
+      required bool enable,
+      dynamic hint}) {
+    return false;
+  }
+
+  String mainResolveAvatarUrl({required String avatar, dynamic hint}) {
+    return js.context.callMethod('getByName', ['resolve_avatar_url', avatar])?.toString() ?? avatar;
   }
 
   void dispose() {}
