@@ -128,6 +128,10 @@ impl ConnectionRoundState {
             true
         }
     }
+
+    pub fn is_connected(&self) -> bool {
+        matches!(self.state, ConnectionState::Connected)
+    }
 }
 
 impl Default for ConnectionRoundState {
@@ -175,13 +179,16 @@ impl SessionPermissionConfig {
         *self.server_clipboard_enabled.read().unwrap()
             && *self.server_keyboard_enabled.read().unwrap()
             && !self.lc.read().unwrap().disable_clipboard.v
+            && !self.lc.read().unwrap().view_only.v
     }
 
     #[cfg(feature = "unix-file-copy-paste")]
     pub fn is_file_clipboard_required(&self) -> bool {
+        let lc = self.lc.read().unwrap();
         *self.server_keyboard_enabled.read().unwrap()
             && *self.server_file_transfer_enabled.read().unwrap()
-            && self.lc.read().unwrap().enable_file_copy_paste.v
+            && lc.enable_file_copy_paste.v
+            && !lc.view_only.v
     }
 }
 
@@ -411,13 +418,16 @@ impl<T: InvokeUiSession> Session<T> {
         *self.server_clipboard_enabled.read().unwrap()
             && *self.server_keyboard_enabled.read().unwrap()
             && !self.lc.read().unwrap().disable_clipboard.v
+            && !self.lc.read().unwrap().view_only.v
     }
 
     #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
     pub fn is_file_clipboard_required(&self) -> bool {
+        let lc = self.lc.read().unwrap();
         *self.server_keyboard_enabled.read().unwrap()
             && *self.server_file_transfer_enabled.read().unwrap()
-            && self.lc.read().unwrap().enable_file_copy_paste.v
+            && lc.enable_file_copy_paste.v
+            && !lc.view_only.v
     }
 
     #[cfg(feature = "flutter")]
@@ -554,7 +564,7 @@ impl<T: InvokeUiSession> Session<T> {
 
     pub fn restart_remote_device(&self) {
         let mut lc = self.lc.write().unwrap();
-        lc.restarting_remote_device = true;
+        lc.mark_restarting_remote_device();
         let msg = lc.restart_remote_device();
         self.send(Data::Message(msg));
     }
@@ -650,7 +660,7 @@ impl<T: InvokeUiSession> Session<T> {
     }
 
     pub fn is_restarting_remote_device(&self) -> bool {
-        self.lc.read().unwrap().restarting_remote_device
+        self.lc.read().unwrap().is_restarting_remote_device()
     }
 
     #[inline]
